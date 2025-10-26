@@ -1,0 +1,41 @@
+# Compiled binaries
+mge_tournament
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+# CMake build directory
+build/
+cmake-build-*/
+
+# Downloaded dependencies
+include/
+_deps/
+
+# API credentials (IMPORTANT!)
+api_key.txt
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+*.backup
+
+# Run script (generated)
+run_tournament.sh
