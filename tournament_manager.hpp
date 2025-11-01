@@ -6,6 +6,7 @@
 #include <optional>
 #include <set>
 #include <memory>
+#include <queue>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -21,6 +22,9 @@ namespace mge
     std::string steamId;
     std::string name;
     int elo;
+    int clientId;
+    int arena;
+    bool inArena;
 
     json toJson() const
     {
@@ -53,7 +57,7 @@ namespace mge
   struct WebSocketConnection
   {
     lws *wsi;
-    std::string type; // "server" or "admin"
+    std::string type;
     std::vector<std::string> messageQueue;
   };
 
@@ -97,17 +101,31 @@ namespace mge
     std::unique_ptr<ChallongeAPI> challonge;
     lws_context *context;
 
+    lws *mgeClientWsi;
+    bool mgeConnected;
+    std::queue<std::string> mgeOutgoingMessages;
+    bool tournamentActive;
+    std::map<std::string, int> steamIdToClientId;
+    std::map<int, std::string> clientIdToSteamId;
+
     std::optional<int> getOpenArena();
     void assignPendingMatches();
     bool isPlayerInMatch(const std::string &steamId) const;
     void broadcastToServers(const json &message);
     void sendToConnection(WebSocketConnection *conn, const json &message);
 
+    void sendToMGEPlugin(const json &message);
+    void handleMGEEvent(const json &event);
+    void requestPlayersFromMGE();
+    void requestArenasFromMGE();
+    void addPlayerToMGEArena(int clientId, int arenaId);
+
   public:
     TournamentManager(lws_context *ctx, const std::string &challongeUser,
                       const std::string &challongeKey, const std::string &tournamentUrl);
 
     void handleMessage(lws *wsi, const std::string &message);
+    void handleMGEPluginMessage(const std::string &message);
     void addConnection(lws *wsi);
     void removeConnection(lws *wsi);
     void queueMessage(lws *wsi, const std::string &message);
@@ -123,6 +141,13 @@ namespace mge
     void handleMatchDetails(const json &payload);
     void handleSetMatchScore(lws *wsi, const json &payload);
     void handleMatchCancel(const json &payload);
+
+    void setMGEClientWsi(lws *wsi);
+    void onMGEConnected();
+    void onMGEDisconnected();
+    void queueMGEMessage(const std::string &message);
+    bool hasMGEQueuedMessages() const;
+    std::string popMGEMessage();
   };
 
 }

@@ -4,6 +4,8 @@
 #include <iostream>
 #include <sstream>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 
 namespace mge
 {
@@ -268,7 +270,7 @@ namespace mge
 
   TournamentManager::TournamentManager(lws_context *ctx, const std::string &challongeUser,
                                        const std::string &challongeKey, const std::string &tournamentUrl)
-      : context(ctx), arenas(NUM_ARENAS)
+      : context(ctx), arenas(NUM_ARENAS), mgeClientWsi(nullptr), mgeConnected(false), tournamentActive(false)
   {
 
     arenaPriority = {5, 6, 7, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16};
@@ -369,8 +371,170 @@ namespace mge
     }
   }
 
+  void TournamentManager::sendToMGEPlugin(const json &message)
+  {
+    if (!mgeConnected || !mgeClientWsi)
+    {
+      std::cerr << "Cannot send to MGE plugin: not connected" << std::endl;
+      return;
+    }
+
+    std::string msgStr = message.dump();
+    mgeOutgoingMessages.push(msgStr);
+    lws_callback_on_writable(mgeClientWsi);
+  }
+
+  void TournamentManager::requestPlayersFromMGE()
+  {
+    json request = {{"command", "get_players"}};
+    sendToMGEPlugin(request);
+  }
+
+  void TournamentManager::requestArenasFromMGE()
+  {
+    json request = {{"command", "get_arenas"}};
+    sendToMGEPlugin(request);
+  }
+
+  void TournamentManager::addPlayerToMGEArena(int clientId, int arenaId)
+  {
+    json request = {
+        {"command", "add_player_to_arena"},
+        {"player_id", clientId},
+        {"arena_id", arenaId}};
+    sendToMGEPlugin(request);
+  }
+
+  void TournamentManager::handleMGEPluginMessage(const std::string &message)
+  {
+    try
+    {
+      json j = json::parse(message);
+
+      if (!j.contains("type"))
+      {
+        return;
+      }
+
+      std::string type = j["type"];
+
+      if (type == "welcome")
+      {
+        std::cout << "Connected to MGE plugin: " << j.value("message", "") << std::endl;
+        requestArenasFromMGE();
+        requestPlayersFromMGE();
+      }
+      else if (type == "response")
+      {
+        std::string command = j.value("command", "");
+
+        if (command == "get_players")
+        {
+          players.clear();
+          steamIdToClientId.clear();
+          clientIdToSteamId.clear();
+
+          if (j.contains("players"))
+          {
+            for (const auto &p : j["players"])
+            {
+              Player player;
+              player.clientId = p.value("id", 0);
+              player.name = p.value("name", "");
+              player.arena = p.value("arena", 0);
+              player.inArena = p.value("inArena", false);
+              player.elo = p.value("elo", 1000);
+
+              char steamIdBuf[64];
+              snprintf(steamIdBuf, sizeof(steamIdBuf), "STEAM_ID_%d", player.clientId);
+              player.steamId = steamIdBuf;
+
+              steamIdToClientId[player.steamId] = player.clientId;
+              clientIdToSteamId[player.clientId] = player.steamId;
+
+              players.push_back(player);
+            }
+            std::cout << "Received " << players.size() << " players from MGE plugin" << std::endl;
+          }
+        }
+        else if (command == "get_arenas")
+        {
+          std::cout << "Received arena info from MGE plugin" << std::endl;
+        }
+      }
+      else if (type == "event")
+      {
+        handleMGEEvent(j);
+      }
+      else if (type == "success")
+      {
+        std::cout << "MGE Plugin Success: " << j.value("message", "") << std::endl;
+      }
+      else if (type == "error")
+      {
+        std::cerr << "MGE Plugin Error: " << j.value("message", "") << std::endl;
+      }
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error handling MGE plugin message: " << e.what() << std::endl;
+    }
+  }
+
+  void TournamentManager::handleMGEEvent(const json &event)
+  {
+    std::string eventType = event.value("event", "");
+
+    if (eventType == "match_end_1v1")
+    {
+      int winnerId = event.value("winner_id", 0);
+      int loserId = event.value("loser_id", 0);
+      int arenaId = event.value("arena_id", 0);
+
+      if (clientIdToSteamId.count(winnerId) && clientIdToSteamId.count(loserId))
+      {
+        std::string winnerSteamId = clientIdToSteamId[winnerId];
+        std::string loserSteamId = clientIdToSteamId[loserId];
+
+        std::cout << "Match ended: " << event.value("winner_name", "")
+                  << " beat " << event.value("loser_name", "") << std::endl;
+
+        if (tournamentActive)
+        {
+          challonge->reportMatch(winnerSteamId, loserSteamId);
+
+          if (arenaId > 0 && arenaId <= NUM_ARENAS)
+          {
+            arenas[arenaId - 1].clear();
+          }
+
+          assignPendingMatches();
+        }
+      }
+    }
+    else if (eventType == "player_arena_removed")
+    {
+      int arenaId = event.value("arena_id", 0);
+      if (arenaId > 0 && arenaId <= NUM_ARENAS)
+      {
+        int playerId = event.value("player_id", 0);
+        if (clientIdToSteamId.count(playerId))
+        {
+          std::string steamId = clientIdToSteamId[playerId];
+          arenas[arenaId - 1].currentMatch.reset();
+        }
+      }
+    }
+  }
+
   void TournamentManager::assignPendingMatches()
   {
+    if (!mgeConnected)
+    {
+      std::cout << "Cannot assign matches: not connected to MGE plugin" << std::endl;
+      return;
+    }
+
     auto pendingMatches = challonge->getPendingMatches();
 
     for (const auto &match : pendingMatches)
@@ -391,15 +555,17 @@ namespace mge
       std::set<std::string> matchPlayers = {match.player1Id, match.player2Id};
       arenas[arenaId].currentMatch = matchPlayers;
 
-      json msg = {
-          {"type", "MatchDetails"},
-          {"payload", {{"arenaId", arenaId + 1}, // Convert to 1-indexed
-                       {"p1Id", match.player1Id},
-                       {"p2Id", match.player2Id}}}};
+      if (steamIdToClientId.count(match.player1Id) && steamIdToClientId.count(match.player2Id))
+      {
+        int client1 = steamIdToClientId[match.player1Id];
+        int client2 = steamIdToClientId[match.player2Id];
 
-      broadcastToServers(msg);
-      std::cout << "Assigned match: " << match.player1Name << " vs "
-                << match.player2Name << " to arena " << (arenaId + 1) << std::endl;
+        addPlayerToMGEArena(client1, arenaId + 1);
+        addPlayerToMGEArena(client2, arenaId + 1);
+
+        std::cout << "Assigned match: " << match.player1Name << " vs "
+                  << match.player2Name << " to arena " << (arenaId + 1) << std::endl;
+      }
     }
   }
 
@@ -491,6 +657,22 @@ namespace mge
   void TournamentManager::handleTournamentStart(const json &payload)
   {
     std::cout << "Tournament starting" << std::endl;
+    tournamentActive = true;
+
+    requestPlayersFromMGE();
+
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    int seed = 1;
+    for (const auto &player : players)
+    {
+      std::cout << "Adding player to Challonge: " << player.name << std::endl;
+      challonge->addParticipant(player.name, player.steamId, seed++);
+    }
+
+    challonge->startTournament();
+
+    assignPendingMatches();
 
     json msg = {
         {"type", "TournamentStart"},
@@ -501,6 +683,7 @@ namespace mge
   void TournamentManager::handleTournamentStop(const json &payload)
   {
     std::cout << "Tournament stopping" << std::endl;
+    tournamentActive = false;
 
     for (auto &arena : arenas)
     {
@@ -551,7 +734,7 @@ namespace mge
   {
     std::string winner = payload.value("winner", "");
     std::string loser = payload.value("loser", "");
-    int arena = payload.value("arena", 0) - 1; // Convert to 0-indexed
+    int arena = payload.value("arena", 0) - 1;
 
     std::cout << "Match result: " << winner << " beat " << loser
               << " in arena " << (arena + 1) << std::endl;
@@ -578,7 +761,7 @@ namespace mge
 
   void TournamentManager::handleMatchDetails(const json &payload)
   {
-    int arenaId = payload.value("arenaId", 0) - 1; // Convert to 0-indexed
+    int arenaId = payload.value("arenaId", 0) - 1;
     std::string p1Id = payload.value("p1Id", "");
     std::string p2Id = payload.value("p2Id", "");
 
@@ -604,13 +787,56 @@ namespace mge
 
   void TournamentManager::handleMatchCancel(const json &payload)
   {
-    int arena = payload.value("arena", 0) - 1; // Convert to 0-indexed
+    int arena = payload.value("arena", 0) - 1;
 
     if (arena >= 0 && arena < NUM_ARENAS)
     {
       arenas[arena].clear();
       std::cout << "Match cancelled in arena " << (arena + 1) << std::endl;
     }
+  }
+
+  void TournamentManager::setMGEClientWsi(lws *wsi)
+  {
+    mgeClientWsi = wsi;
+  }
+
+  void TournamentManager::onMGEConnected()
+  {
+    mgeConnected = true;
+    std::cout << "Connected to MGE plugin WebSocket server" << std::endl;
+  }
+
+  void TournamentManager::onMGEDisconnected()
+  {
+    mgeConnected = false;
+    mgeClientWsi = nullptr;
+    std::cout << "Disconnected from MGE plugin WebSocket server" << std::endl;
+  }
+
+  void TournamentManager::queueMGEMessage(const std::string &message)
+  {
+    mgeOutgoingMessages.push(message);
+    if (mgeClientWsi)
+    {
+      lws_callback_on_writable(mgeClientWsi);
+    }
+  }
+
+  bool TournamentManager::hasMGEQueuedMessages() const
+  {
+    return !mgeOutgoingMessages.empty();
+  }
+
+  std::string TournamentManager::popMGEMessage()
+  {
+    if (mgeOutgoingMessages.empty())
+    {
+      return "";
+    }
+    std::string msg = mgeOutgoingMessages.front();
+    mgeOutgoingMessages.pop();
+    return msg;
   }
 
 }

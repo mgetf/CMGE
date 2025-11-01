@@ -31,6 +31,7 @@ target_link_libraries(mge_tournament
     ${CURL_LIBRARIES}
     ${LIBWEBSOCKETS_LIBRARIES}
     nlohmann_json::nlohmann_json
+    pthread
 )
 
 install(TARGETS mge_tournament DESTINATION bin)
