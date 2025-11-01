@@ -53,4 +53,3 @@ See source code for message types.
 ## License
 
 MIT
-```
