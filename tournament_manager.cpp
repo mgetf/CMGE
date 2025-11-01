@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <sstream>
 
 namespace mge
 {
@@ -23,6 +24,75 @@ namespace mge
     loadTournament();
   }
 
+  std::string ChallongeAPI::flattenToForm(const json &j, CURL *curl, const std::string &prefix) const
+  {
+    std::vector<std::string> parts;
+
+    for (auto it = j.begin(); it != j.end(); ++it)
+    {
+      std::string key = prefix.empty() ? it.key() : prefix + "[" + it.key() + "]";
+
+      if (it.value().is_object())
+      {
+        std::string sub = flattenToForm(it.value(), curl, key);
+        if (!sub.empty())
+        {
+          std::stringstream ss(sub);
+          std::string item;
+          while (std::getline(ss, item, '&'))
+          {
+            if (!item.empty())
+            {
+              parts.push_back(item);
+            }
+          }
+        }
+      }
+      else if (it.value().is_null())
+      {
+        continue;
+      }
+      else
+      {
+        std::string value;
+        if (it.value().is_string())
+        {
+          std::string raw = it.value().get<std::string>();
+          char *escaped = curl_easy_escape(curl, raw.c_str(), raw.length());
+          value = escaped;
+          curl_free(escaped);
+        }
+        else if (it.value().is_number_integer())
+        {
+          value = std::to_string(it.value().get<int>());
+        }
+        else if (it.value().is_number_float())
+        {
+          value = std::to_string(it.value().get<double>());
+        }
+        else if (it.value().is_boolean())
+        {
+          value = it.value().get<bool>() ? "true" : "false";
+        }
+        else
+        {
+          continue;
+        }
+
+        parts.push_back(key + "=" + value);
+      }
+    }
+
+    std::string res;
+    for (size_t i = 0; i < parts.size(); ++i)
+    {
+      if (i > 0)
+        res += "&";
+      res += parts[i];
+    }
+    return res;
+  }
+
   std::string ChallongeAPI::makeRequest(const std::string &method,
                                         const std::string &endpoint,
                                         const json &data)
@@ -37,40 +107,53 @@ namespace mge
     }
 
     std::string url = "https://api.challonge.com/v1" + endpoint;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 
-    json requestData = data;
-    requestData["api_key"] = apiKey;
+    std::string auth = username + ":" + apiKey;
+    curl_easy_setopt(curl, CURLOPT_USERPWD, auth.c_str());
 
     struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-    if (method == "POST")
+    if (method == "POST" || method == "PUT")
     {
-      std::string jsonStr = requestData.dump();
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonStr.c_str());
-    }
-    else if (method == "PUT")
-    {
-      std::string jsonStr = requestData.dump();
-      curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
-      curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonStr.c_str());
-    }
-    else if (method == "GET")
-    {
-      std::string params = "?api_key=" + apiKey;
-      for (auto &[key, value] : requestData.items())
-      {
-        if (key != "api_key")
-        {
-          params += "&" + key + "=" + value.get<std::string>();
-        }
-      }
-      url += params;
+      std::string formData = flattenToForm(data, curl, "");
+
+      headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
       curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+      curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, formData.c_str());
+
+      if (method == "POST")
+      {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+      }
+      else
+      {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
+      }
+
+      std::cout << "[DEBUG] " << method << " to " << url << std::endl;
+      std::cout << "[DEBUG] Form data: " << formData << std::endl;
+    }
+    else if (method == "GET" || method == "DELETE")
+    {
+      std::string params = flattenToForm(data, curl, "");
+      if (!params.empty())
+      {
+        url += "?" + params;
+      }
+      curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+      if (method == "DELETE")
+      {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+      }
+
+      std::cout << "[DEBUG] " << method << " to " << url << std::endl;
     }
 
     CURLcode res = curl_easy_perform(curl);
@@ -78,6 +161,17 @@ namespace mge
     if (res != CURLE_OK)
     {
       std::cerr << "CURL error: " << curl_easy_strerror(res) << std::endl;
+    }
+    else
+    {
+      long response_code;
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+      std::cout << "[DEBUG] HTTP response code: " << response_code << std::endl;
+
+      if (response_code >= 400)
+      {
+        std::cerr << "[DEBUG] Error response body: " << response << std::endl;
+      }
     }
 
     curl_slist_free_all(headers);
@@ -88,10 +182,21 @@ namespace mge
 
   void ChallongeAPI::loadTournament()
   {
-    std::string endpoint = "/tournaments/" + subdomain + "-" + tournamentUrl + ".json";
+    std::string endpoint;
+    if (!subdomain.empty())
+    {
+      endpoint = "/tournaments/" + subdomain + "-" + tournamentUrl + ".json";
+    }
+    else
+    {
+      endpoint = "/tournaments/" + tournamentUrl + ".json";
+    }
+
     json params = {{"include_participants", "1"}, {"include_matches", "1"}};
 
+    std::cout << "[DEBUG] Loading tournament from: " << endpoint << std::endl;
     std::string response = makeRequest("GET", endpoint, params);
+    std::cout << "[DEBUG] Tournament response length: " << response.length() << " bytes" << std::endl;
 
     try
     {
@@ -99,48 +204,190 @@ namespace mge
       if (j.contains("tournament") && j["tournament"].contains("id"))
       {
         tournamentId = std::to_string(j["tournament"]["id"].get<int>());
-        std::cout << "Loaded tournament: " << tournamentId << std::endl;
+        std::cout << "✅ Loaded tournament ID: " << tournamentId << std::endl;
+
+        if (j["tournament"].contains("url"))
+        {
+          std::string url = j["tournament"]["url"].get<std::string>();
+          std::cout << "   Tournament URL: " << url << std::endl;
+        }
+      }
+      else
+      {
+        std::cerr << "❌ ERROR: Could not find tournament ID in response!" << std::endl;
+        std::cerr << "   Full response: " << response << std::endl;
       }
     }
     catch (const std::exception &e)
     {
-      std::cerr << "Error parsing tournament: " << e.what() << std::endl;
+      std::cerr << "❌ Error parsing tournament: " << e.what() << std::endl;
+      std::cerr << "   Response was: " << response << std::endl;
     }
   }
 
   void ChallongeAPI::addParticipant(const std::string &name,
                                     const std::string &steamId, int seed)
   {
+    if (tournamentId.empty())
+    {
+      std::cerr << "Cannot add participant: tournament ID is empty!" << std::endl;
+      return;
+    }
+
     std::string endpoint = "/tournaments/" + tournamentId + "/participants.json";
     json data = {
         {"participant", {{"name", name}, {"seed", seed}, {"misc", steamId}}}};
 
+    std::cout << "[DEBUG] Adding participant to tournament " << tournamentId << std::endl;
     std::string response = makeRequest("POST", endpoint, data);
-    std::cout << "Added participant: " << name << std::endl;
+
+    if (response.empty() || response == "[]" || response.length() < 10)
+    {
+      std::cerr << "Failed to add participant " << name << " - empty response" << std::endl;
+      std::cerr << "   Response: " << response << std::endl;
+      return;
+    }
+
+    try
+    {
+      json j = json::parse(response);
+      if (j.contains("errors"))
+      {
+        std::cerr << "Error adding participant " << name << ": " << j["errors"].dump() << std::endl;
+        return;
+      }
+      if (j.contains("participant") && j["participant"].contains("id"))
+      {
+        std::cout << "Added participant: " << name << " (ID: " << j["participant"]["id"] << ")" << std::endl;
+      }
+      else
+      {
+        std::cerr << "Unexpected response when adding " << name << ": " << response << std::endl;
+      }
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error parsing add participant response: " << e.what() << std::endl;
+      std::cerr << "   Response was: " << response << std::endl;
+    }
   }
 
   void ChallongeAPI::startTournament()
   {
+    if (tournamentId.empty())
+    {
+      std::cerr << "Cannot start tournament: tournament ID is empty!" << std::endl;
+      return;
+    }
+
     std::string endpoint = "/tournaments/" + tournamentId + "/start.json";
-    std::string response = makeRequest("POST", endpoint);
-    std::cout << "Started tournament" << std::endl;
+    json data = json::object();
+
+    std::cout << "[DEBUG] Starting tournament " << tournamentId << std::endl;
+    std::string response = makeRequest("POST", endpoint, data);
+
+    if (response.empty() || response.length() < 10)
+    {
+      std::cerr << "Failed to start tournament - empty response" << std::endl;
+      std::cerr << "   Response: " << response << std::endl;
+      return;
+    }
+
+    try
+    {
+      json j = json::parse(response);
+      if (j.contains("errors"))
+      {
+        std::cerr << "Error starting tournament: " << j["errors"].dump() << std::endl;
+        return;
+      }
+      if (j.contains("tournament"))
+      {
+        std::string state = j["tournament"].value("state", "unknown");
+        std::cout << "Tournament started, state: " << state << std::endl;
+      }
+      else
+      {
+        std::cerr << "Unexpected start tournament response: " << response << std::endl;
+      }
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error parsing start tournament response: " << e.what() << std::endl;
+      std::cerr << "   Response was: " << response << std::endl;
+    }
+  }
+
+  void ChallongeAPI::resetTournament()
+  {
+    if (tournamentId.empty())
+    {
+      std::cerr << "Cannot reset tournament: tournament ID is empty!" << std::endl;
+      return;
+    }
+
+    std::cout << "[DEBUG] Resetting tournament " << tournamentId << std::endl;
+
+    std::string participantsEndpoint = "/tournaments/" + tournamentId + "/participants.json";
+    std::string participantsResponse = makeRequest("GET", participantsEndpoint, json::object());
+
+    try
+    {
+      json participantsJson = json::parse(participantsResponse);
+
+      for (auto &p : participantsJson)
+      {
+        if (p.contains("participant"))
+        {
+          int participantId = p["participant"]["id"].get<int>();
+          std::string deleteEndpoint = "/tournaments/" + tournamentId +
+                                       "/participants/" + std::to_string(participantId) + ".json";
+          std::cout << "[DEBUG] Deleting participant " << participantId << std::endl;
+          makeRequest("DELETE", deleteEndpoint, json::object());
+        }
+      }
+
+      std::string resetEndpoint = "/tournaments/" + tournamentId + "/reset.json";
+      std::cout << "[DEBUG] Resetting tournament state" << std::endl;
+      makeRequest("POST", resetEndpoint, json::object());
+
+      std::cout << "Tournament reset complete" << std::endl;
+    }
+    catch (const std::exception &e)
+    {
+      std::cerr << "Error resetting tournament: " << e.what() << std::endl;
+    }
   }
 
   std::vector<PendingMatch> ChallongeAPI::getPendingMatches()
   {
+    if (tournamentId.empty())
+    {
+      std::cerr << "❌ Cannot get matches: tournament ID is empty!" << std::endl;
+      return {};
+    }
+
     std::string endpoint = "/tournaments/" + tournamentId + "/matches.json";
     json params = {{"state", "open"}};
 
+    std::cout << "[DEBUG] Calling Challonge API: " << endpoint << std::endl;
     std::string response = makeRequest("GET", endpoint, params);
+    std::cout << "[DEBUG] Challonge matches response length: " << response.length() << " bytes" << std::endl;
+
     std::vector<PendingMatch> matches;
 
     try
     {
       json matchesJson = json::parse(response);
+      std::cout << "[DEBUG] Parsed matches JSON, size: " << matchesJson.size() << std::endl;
 
       std::string participantsEndpoint = "/tournaments/" + tournamentId + "/participants.json";
-      std::string participantsResponse = makeRequest("GET", participantsEndpoint);
+      std::cout << "[DEBUG] Calling Challonge API: " << participantsEndpoint << std::endl;
+      std::string participantsResponse = makeRequest("GET", participantsEndpoint, json::object());
+      std::cout << "[DEBUG] Challonge participants response length: " << participantsResponse.length() << " bytes" << std::endl;
+
       json participantsJson = json::parse(participantsResponse);
+      std::cout << "[DEBUG] Parsed participants JSON, size: " << participantsJson.size() << std::endl;
 
       std::map<int, std::pair<std::string, std::string>> idToPlayer;
 
@@ -153,6 +400,7 @@ namespace mge
           std::string name = participant["name"].get<std::string>();
           std::string steamId = participant.contains("misc") ? participant["misc"].get<std::string>() : "";
           idToPlayer[id] = {name, steamId};
+          std::cout << "[DEBUG] Participant mapping: ID " << id << " = " << name << " (Steam: " << steamId << ")" << std::endl;
         }
       }
 
@@ -167,10 +415,15 @@ namespace mge
           {
 
             if (!match["winner_id"].is_null())
+            {
+              std::cout << "[DEBUG] Skipping completed match" << std::endl;
               continue;
+            }
 
             int p1Id = match["player1_id"].get<int>();
             int p2Id = match["player2_id"].get<int>();
+
+            std::cout << "[DEBUG] Found open match: player " << p1Id << " vs player " << p2Id << std::endl;
 
             if (idToPlayer.count(p1Id) && idToPlayer.count(p2Id))
             {
@@ -180,6 +433,12 @@ namespace mge
               pm.player2Name = idToPlayer[p2Id].first;
               pm.player2Id = idToPlayer[p2Id].second;
               matches.push_back(pm);
+
+              std::cout << "[DEBUG] Added pending match: " << pm.player1Name << " vs " << pm.player2Name << std::endl;
+            }
+            else
+            {
+              std::cout << "[DEBUG] Could not find player info for match" << std::endl;
             }
           }
         }
@@ -187,14 +446,21 @@ namespace mge
     }
     catch (const std::exception &e)
     {
-      std::cerr << "Error parsing pending matches: " << e.what() << std::endl;
+      std::cerr << "[DEBUG] Error parsing pending matches: " << e.what() << std::endl;
     }
 
+    std::cout << "[DEBUG] Returning " << matches.size() << " pending matches" << std::endl;
     return matches;
   }
 
   void ChallongeAPI::reportMatch(const std::string &winnerId, const std::string &loserId)
   {
+    if (tournamentId.empty())
+    {
+      std::cerr << "Cannot report match: tournament ID is empty!" << std::endl;
+      return;
+    }
+
     std::string matchesEndpoint = "/tournaments/" + tournamentId + "/matches.json";
     json params = {{"state", "open"}};
     std::string response = makeRequest("GET", matchesEndpoint, params);
@@ -204,7 +470,7 @@ namespace mge
       json matchesJson = json::parse(response);
 
       std::string participantsEndpoint = "/tournaments/" + tournamentId + "/participants.json";
-      std::string participantsResponse = makeRequest("GET", participantsEndpoint);
+      std::string participantsResponse = makeRequest("GET", participantsEndpoint, json::object());
       json participantsJson = json::parse(participantsResponse);
 
       std::map<std::string, int> steamIdToParticipantId;
@@ -275,8 +541,7 @@ namespace mge
 
     arenaPriority = {5, 6, 7, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 
-    std::string subdomain = "89c2a59aadab1761b8e29117";
-    challonge = std::make_unique<ChallongeAPI>(challongeUser, challongeKey, subdomain, tournamentUrl);
+    challonge = std::make_unique<ChallongeAPI>(challongeUser, challongeKey, "", tournamentUrl);
   }
 
   void TournamentManager::addConnection(lws *wsi)
@@ -407,16 +672,20 @@ namespace mge
 
   void TournamentManager::handleMGEPluginMessage(const std::string &message)
   {
+    std::cout << "[DEBUG] MGE Plugin Message: " << message << std::endl;
+
     try
     {
       json j = json::parse(message);
 
       if (!j.contains("type"))
       {
+        std::cout << "[DEBUG] No type field" << std::endl;
         return;
       }
 
       std::string type = j["type"];
+      std::cout << "[DEBUG] Message type: " << type << std::endl;
 
       if (type == "welcome")
       {
@@ -427,15 +696,21 @@ namespace mge
       else if (type == "response")
       {
         std::string command = j.value("command", "");
+        std::cout << "[DEBUG] Response command: " << command << std::endl;
 
         if (command == "get_players")
         {
+          std::cout << "[DEBUG] Processing get_players response" << std::endl;
+          std::cout << "[DEBUG] tournamentActive = " << (tournamentActive ? "true" : "false") << std::endl;
+
           players.clear();
           steamIdToClientId.clear();
           clientIdToSteamId.clear();
 
           if (j.contains("players"))
           {
+            std::cout << "[DEBUG] Players array found, size: " << j["players"].size() << std::endl;
+
             for (const auto &p : j["players"])
             {
               Player player;
@@ -453,8 +728,36 @@ namespace mge
               clientIdToSteamId[player.clientId] = player.steamId;
 
               players.push_back(player);
+              std::cout << "[DEBUG] Added player: " << player.name << " (ID: " << player.clientId << ", ELO: " << player.elo << ")" << std::endl;
             }
             std::cout << "Received " << players.size() << " players from MGE plugin" << std::endl;
+
+            if (tournamentActive && players.size() > 0)
+            {
+              std::cout << "[DEBUG] Tournament is active, proceeding to add players to Challonge" << std::endl;
+              std::cout << "Starting tournament with " << players.size() << " players" << std::endl;
+
+              int seed = 1;
+              for (const auto &player : players)
+              {
+                std::cout << "Adding player to Challonge: " << player.name << " (ELO: " << player.elo << ", Seed: " << seed << ")" << std::endl;
+                challonge->addParticipant(player.name, player.steamId, seed++);
+              }
+
+              std::cout << "[DEBUG] All players added, starting Challonge tournament" << std::endl;
+              challonge->startTournament();
+
+              std::cout << "[DEBUG] Tournament started, assigning pending matches" << std::endl;
+              assignPendingMatches();
+            }
+            else
+            {
+              std::cout << "[DEBUG] Not starting - tournamentActive=" << tournamentActive << ", players=" << players.size() << std::endl;
+            }
+          }
+          else
+          {
+            std::cout << "[DEBUG] No players array in response" << std::endl;
           }
         }
         else if (command == "get_arenas")
@@ -535,12 +838,24 @@ namespace mge
       return;
     }
 
+    std::cout << "[DEBUG] Fetching pending matches from Challonge..." << std::endl;
     auto pendingMatches = challonge->getPendingMatches();
+    std::cout << "[DEBUG] Got " << pendingMatches.size() << " pending matches" << std::endl;
+
+    if (pendingMatches.empty())
+    {
+      std::cout << "[DEBUG] No pending matches available" << std::endl;
+      return;
+    }
 
     for (const auto &match : pendingMatches)
     {
+      std::cout << "[DEBUG] Processing match: " << match.player1Name << " vs " << match.player2Name << std::endl;
+      std::cout << "[DEBUG] Player 1 ID: " << match.player1Id << ", Player 2 ID: " << match.player2Id << std::endl;
+
       if (isPlayerInMatch(match.player1Id) || isPlayerInMatch(match.player2Id))
       {
+        std::cout << "[DEBUG] One or both players already in a match, skipping" << std::endl;
         continue;
       }
 
@@ -555,16 +870,29 @@ namespace mge
       std::set<std::string> matchPlayers = {match.player1Id, match.player2Id};
       arenas[arenaId].currentMatch = matchPlayers;
 
+      std::cout << "[DEBUG] Checking if players exist in mapping..." << std::endl;
+      std::cout << "[DEBUG] steamIdToClientId has " << steamIdToClientId.size() << " entries" << std::endl;
+      std::cout << "[DEBUG] Looking for player1Id: " << match.player1Id << std::endl;
+      std::cout << "[DEBUG] Looking for player2Id: " << match.player2Id << std::endl;
+
       if (steamIdToClientId.count(match.player1Id) && steamIdToClientId.count(match.player2Id))
       {
         int client1 = steamIdToClientId[match.player1Id];
         int client2 = steamIdToClientId[match.player2Id];
+
+        std::cout << "[DEBUG] Found client IDs: " << client1 << " and " << client2 << std::endl;
 
         addPlayerToMGEArena(client1, arenaId + 1);
         addPlayerToMGEArena(client2, arenaId + 1);
 
         std::cout << "Assigned match: " << match.player1Name << " vs "
                   << match.player2Name << " to arena " << (arenaId + 1) << std::endl;
+      }
+      else
+      {
+        std::cout << "[DEBUG] ERROR: Could not find client IDs for players!" << std::endl;
+        std::cout << "[DEBUG] Player 1 (" << match.player1Id << ") exists: " << (steamIdToClientId.count(match.player1Id) ? "YES" : "NO") << std::endl;
+        std::cout << "[DEBUG] Player 2 (" << match.player2Id << ") exists: " << (steamIdToClientId.count(match.player2Id) ? "YES" : "NO") << std::endl;
       }
     }
   }
@@ -659,25 +987,12 @@ namespace mge
     std::cout << "Tournament starting" << std::endl;
     tournamentActive = true;
 
+    std::cout << "[DEBUG] Resetting tournament..." << std::endl;
+    challonge->resetTournament();
+
     requestPlayersFromMGE();
 
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    int seed = 1;
-    for (const auto &player : players)
-    {
-      std::cout << "Adding player to Challonge: " << player.name << std::endl;
-      challonge->addParticipant(player.name, player.steamId, seed++);
-    }
-
-    challonge->startTournament();
-
-    assignPendingMatches();
-
-    json msg = {
-        {"type", "TournamentStart"},
-        {"payload", json::object()}};
-    broadcastToServers(msg);
+    std::cout << "Waiting for player list from MGE plugin..." << std::endl;
   }
 
   void TournamentManager::handleTournamentStop(const json &payload)

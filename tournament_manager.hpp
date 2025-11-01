@@ -8,6 +8,7 @@
 #include <memory>
 #include <queue>
 #include <nlohmann/json.hpp>
+#include <curl/curl.h>
 
 using json = nlohmann::json;
 
@@ -74,6 +75,8 @@ namespace mge
                             const std::string &endpoint,
                             const json &data = json::object());
 
+    std::string flattenToForm(const json &j, CURL *curl, const std::string &prefix = "") const;
+
   public:
     ChallongeAPI(const std::string &user, const std::string &key,
                  const std::string &subdomain, const std::string &tournamentUrl);
@@ -83,6 +86,7 @@ namespace mge
     void startTournament();
     std::vector<PendingMatch> getPendingMatches();
     void reportMatch(const std::string &winnerId, const std::string &loserId);
+    void resetTournament();
 
     const std::string &getTournamentId() const { return tournamentId; }
   };

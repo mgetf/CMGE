@@ -3,25 +3,62 @@ import asyncio
 import websockets
 import json
 import time
+import random
 
 connected_clients = set()
+
+arena_players = {i: set() for i in range(1, 17)}
+
+async def simulate_match(websocket, arena_id, players_in_arena):
+    """
+    Simulates a match and sends the result.
+    This is now a separate function to be called only when an arena is full.
+    """
+    print(f"   🔥 Arena {arena_id} is full. Simulating match between players {players_in_arena}...")
+    await asyncio.sleep(5)  # Shorter simulation time for faster testing
+
+    player_list = list(players_in_arena)
+    winner_id = random.choice(player_list)
+    loser_id = player_list[0] if player_list[1] == winner_id else player_list[1]
+
+    # Mock player names based on ID
+    players_map = {
+        1: "Shaaden", 2: "BobAmmomod", 3: "CharlieSpire", 4: "DaveShotgunStall"
+    }
+
+    print(f"   🏆 Match in Arena {arena_id} ended! Winner: Player {winner_id}")
+    event = {
+        "type": "event",
+        "event": "match_end_1v1",
+        "arena_id": arena_id,
+        "winner_id": winner_id,
+        "loser_id": loser_id,
+        "winner_name": players_map.get(winner_id, f"Player{winner_id}"),
+        "loser_name": players_map.get(loser_id, f"Player{loser_id}"),
+        "winner_score": 20,
+        "loser_score": random.randint(0, 19),
+        "timestamp": int(time.time())
+    }
+    await websocket.send(json.dumps(event))
+
+    # Clear the arena for the next match
+    print(f"   🧹 Clearing arena {arena_id}")
+    arena_players[arena_id].clear()
+
 
 async def handler(websocket):
     connected_clients.add(websocket)
     print(f"✅ Client connected from {websocket.remote_address}")
     
-    welcome = {
-        "type": "welcome",
-        "message": "Connected to Mock MGE Server",
-        "arenas": 16
-    }
-    await websocket.send(json.dumps(welcome))
-    
+    # Reset state on new connection for clean tests
+    for arena_id in arena_players:
+        arena_players[arena_id].clear()
+
     try:
         async for message in websocket:
             print(f"📩 Received: {message}")
             data = json.loads(message)
-            
+
             if data.get("command") == "get_players":
                 print("   → Sending 4 test players")
                 response = {
@@ -35,61 +72,24 @@ async def handler(websocket):
                     ]
                 }
                 await websocket.send(json.dumps(response))
-                
-            elif data.get("command") == "get_arenas":
-                print("   → Sending arena list")
-                response = {
-                    "type": "response",
-                    "command": "get_arenas",
-                    "arenas": [
-                        {"id": i, "name": f"Spire {i}", "players": 0, "max": 2, 
-                         "status": 0, "is2v2": False, "game_mode": 1}
-                        for i in range(1, 17)
-                    ]
-                }
-                await websocket.send(json.dumps(response))
-                
+
             elif data.get("command") == "add_player_to_arena":
                 player_id = data.get("player_id")
                 arena_id = data.get("arena_id")
+                
                 print(f"   → Adding player {player_id} to arena {arena_id}")
                 
-                response = {
-                    "type": "success",
-                    "message": "Player added to arena",
-                    "player_id": player_id,
-                    "arena_id": arena_id
-                }
+                # Add player to our state
+                arena_players[arena_id].add(player_id)
+                
+                response = { "type": "success", "message": "Player added to arena" }
                 await websocket.send(json.dumps(response))
                 
-                print(f"   ⏳ Simulating 10 second match...")
-                await asyncio.sleep(10)
-                
-                winner_id = player_id
-                loser_id = player_id + 1 if player_id % 2 == 1 else player_id - 1
-                
-                players = {
-                    1: "AliceTheScout",
-                    2: "BobTheSoldier", 
-                    3: "CharlieDemoman",
-                    4: "DaveMedic"
-                }
-                
-                print(f"   🏆 Match ended! Winner: Player {winner_id}")
-                event = {
-                    "type": "event",
-                    "event": "match_end_1v1",
-                    "arena_id": arena_id,
-                    "winner_id": winner_id,
-                    "loser_id": loser_id,
-                    "winner_name": players.get(winner_id, f"Player{winner_id}"),
-                    "loser_name": players.get(loser_id, f"Player{loser_id}"),
-                    "winner_score": 20,
-                    "loser_score": 15,
-                    "timestamp": int(time.time())
-                }
-                await websocket.send(json.dumps(event))
-                
+                # Check if the arena is now full
+                if len(arena_players[arena_id]) == 2:
+                    # If full, start the simulation for the correct players
+                    await simulate_match(websocket, arena_id, arena_players[arena_id])
+
     except websockets.exceptions.ConnectionClosed:
         print(f"❌ Client disconnected")
     finally:
@@ -97,7 +97,7 @@ async def handler(websocket):
 
 async def main():
     print("=" * 60)
-    print("🎮 Mock MGE Server Starting")
+    print("🎮 Mock MGE Server (Stateful Version)")
     print("=" * 60)
     print("Listening on: ws://localhost:9001")
     print("Waiting for tournament manager to connect...\n")
