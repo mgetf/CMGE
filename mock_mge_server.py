@@ -28,10 +28,10 @@ async def handler(websocket):
                     "type": "response",
                     "command": "get_players",
                     "players": [
-                        {"id": 1, "name": "AliceTheScout", "elo": 1800, "arena": 0, "inArena": False},
-                        {"id": 2, "name": "BobTheSoldier", "elo": 1600, "arena": 0, "inArena": False},
-                        {"id": 3, "name": "CharlieDemoman", "elo": 1700, "arena": 0, "inArena": False},
-                        {"id": 4, "name": "DaveMedic", "elo": 1500, "arena": 0, "inArena": False},
+                        {"id": 1, "name": "Shaaden", "elo": 1800, "arena": 0, "inArena": False},
+                        {"id": 2, "name": "BobAmmomod", "elo": 1600, "arena": 0, "inArena": False},
+                        {"id": 3, "name": "CharlieSpire", "elo": 1700, "arena": 0, "inArena": False},
+                        {"id": 4, "name": "DaveShotgunStall", "elo": 1500, "arena": 0, "inArena": False},
                     ]
                 }
                 await websocket.send(json.dumps(response))
