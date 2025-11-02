@@ -68,7 +68,7 @@ The manager requires the URL slug of a pre-created Challonge tournament as a com
 ./build/mge_tournament <your_challonge_tournament_url>
 ```
 
-Example: `./mge_tournament my_weekly_cup_42`
+Example: `./build/mge_tournament my_weekly_cup_42`
 
 The manager will start, connect to the mock server, and host the admin panel.
 
